@@ -1,0 +1,167 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model (예상 데이터 구조 정의)
+// ===============================================================
+//
+// 이 보안 규칙 파일은 영어 단어 학습 웹앱을 위해 다음과 같은 데이터 구조를 가정합니다:
+//
+// 1. Collection: users
+//    Document ID: {userId} (Firebase Auth의 사용자 고유 UID와 동일)
+//    Fields:
+//      - uid: string (필수, 변경 불가, 1~128자) - 사용자의 고유 식별자
+//      - displayName: string (선택 또는 null, 0~100자) - 사용자 표시 이름
+//      - encryptedEmail: string (선택 또는 null, 0~500자) - 암호화된 이메일 주소 (개인정보 보호)
+//      - photoURL: string (선택 또는 null, 0~1000자) - 프로필 사진 URL
+//      - updatedAt: timestamp | string | int (필수) - 마지막 프로필 갱신 시각
+//
+// 2. Subcollection: users/{userId}/words
+//    Document ID: {wordId} (자동 생성되거나 고유한 단어 ID)
+//    Fields:
+//      - english: string (필수, 1~200자) - 학습할 영단어 또는 숙어
+//      - korean: string (필수, 1~500자) - 영단어의 한국어 뜻
+//      - example: string (선택, 0~1000자) - 단어 활용 예문
+//      - memorized: bool (필수) - 암기 완료 여부 (true: 암기함, false: 미암기)
+//      - createdAt: timestamp | string | int (필수, 수정 시 변경 불가) - 단어 최초 등록 시각
+//      - updatedAt: timestamp | string | int (필수) - 단어 정보 마지막 수정 시각
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions (공통 보조 함수 모음)
+    // ===============================================================
+
+    // 1. 사용자가 로그인(인증)되어 있는지 확인하는 함수입니다.
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // 2. 현재 로그인한 사용자가 해당 문서의 주인(소유자)인지 확인하는 함수입니다.
+    // 경로의 {userId}와 로그인한 사용자의 UID(request.auth.uid)가 일치해야 합니다.
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // 3. 허용된 필드(데이터 항목)만 포함되어 있는지 확인하는 함수입니다.
+    // 해커나 악의적인 사용자가 정의되지 않은 임의의 데이터를 몰래 추가하는 것을 막아줍니다.
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // 4. 필수 필드들이 모두 빠짐없이 들어있는지 확인하는 함수입니다.
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // 5. 날짜/시간 데이터의 형식이 올바른지 확인하는 함수입니다.
+    // Firestore 서버 타임스탬프(timestamp), 문자열(string, 최대 100자), 또는 숫자(int) 형식을 허용합니다.
+    function isValidTimeField(val) {
+      return val is timestamp ||
+             (val is string && val.size() >= 1 && val.size() <= 100) ||
+             val is int;
+    }
+
+    // 6. 선택적(Optional) 문자열 필드가 올바른지 검사하는 함수입니다.
+    // 아예 생략되었거나, null 이거나, 지정된 길이(minLen ~ maxLen) 이내의 문자열이어야 합니다.
+    function isValidOptionalString(field, minLen, maxLen) {
+      return !(field in request.resource.data) ||
+             request.resource.data[field] == null ||
+             (request.resource.data[field] is string &&
+              request.resource.data[field].size() >= minLen &&
+              request.resource.data[field].size() <= maxLen);
+    }
+
+    // ===============================================================
+    // Domain Validators (도메인 데이터 검증 함수)
+    // 주의: 생성(create)과 수정(update) 모두에 적용하여 우회 공격을 방지합니다.
+    // ===============================================================
+
+    // [사용자 프로필 검증 함수]
+    // 허용된 5개 필드만 존재하는지, uid가 본인의 ID와 일치하는지, 각 문자열 길이가 안전한지 검사합니다.
+    function isValidUser(userId) {
+      let allowedFields = ['uid', 'displayName', 'encryptedEmail', 'photoURL', 'updatedAt'];
+      let data = request.resource.data;
+
+      return hasOnlyAllowedFields(allowedFields) &&
+             hasRequiredFields(['uid', 'updatedAt']) &&
+             data.uid is string &&
+             data.uid == userId &&
+             data.uid.size() >= 1 && data.uid.size() <= 128 &&
+             isValidOptionalString('displayName', 0, 100) &&
+             isValidOptionalString('encryptedEmail', 0, 500) &&
+             isValidOptionalString('photoURL', 0, 1000) &&
+             isValidTimeField(data.updatedAt);
+    }
+
+    // [단어장 데이터 검증 함수]
+    // 필수 필드(english, korean, memorized, createdAt, updatedAt)와 선택 필드(example)의 타입 및 글자 수를 엄격히 검사합니다.
+    function isValidWord() {
+      let allowedFields = ['english', 'korean', 'example', 'memorized', 'createdAt', 'updatedAt'];
+      let requiredFields = ['english', 'korean', 'memorized', 'createdAt', 'updatedAt'];
+      let data = request.resource.data;
+
+      return hasOnlyAllowedFields(allowedFields) &&
+             hasRequiredFields(requiredFields) &&
+             // 영어 단어: 문자열이며 1자 이상 200자 이하
+             data.english is string &&
+             data.english.size() >= 1 && data.english.size() <= 200 &&
+             // 한국어 뜻: 문자열이며 1자 이상 500자 이하
+             data.korean is string &&
+             data.korean.size() >= 1 && data.korean.size() <= 500 &&
+             // 예문(선택): 없거나, 문자열이며 0자 이상 1000자 이하
+             isValidOptionalString('example', 0, 1000) &&
+             // 암기 여부: 반드시 참/거짓(boolean) 형태여야 함
+             data.memorized is bool &&
+             // 생성 시각 및 수정 시각 검증
+             isValidTimeField(data.createdAt) &&
+             isValidTimeField(data.updatedAt);
+    }
+
+    // ===============================================================
+    // Collection Rules (컬렉션별 접근 권한 규칙)
+    // ===============================================================
+
+    // 1. 사용자 프로필 문서 규칙 (users/{userId})
+    match /users/{userId} {
+      // 조회(get, list 포함 read): 본인만 자신의 프로필 문서를 읽을 수 있습니다 (개인정보 보호).
+      allow read: if isOwner(userId);
+
+      // 생성(create): 본인만 생성할 수 있으며, 데이터 구조가 유효해야 합니다.
+      allow create: if isOwner(userId) && isValidUser(userId);
+
+      // 수정(update): 본인만 수정할 수 있으며, 데이터 구조가 유효하고 uid가 기존과 동일해야 합니다.
+      allow update: if isOwner(userId) &&
+                    isValidUser(userId) &&
+                    request.resource.data.uid == resource.data.uid;
+
+      // 삭제(delete): 본인만 자신의 프로필 문서를 삭제할 수 있습니다.
+      allow delete: if isOwner(userId);
+
+      // 2. 사용자별 영단어 서브컬렉션 규칙 (users/{userId}/words/{wordId})
+      match /words/{wordId} {
+        // 읽기(read - 단일 조회 및 목록 쿼리 모두 포함): 본인의 단어장만 읽을 수 있습니다.
+        allow read: if isOwner(userId);
+
+        // 생성(create): 본인의 단어장에만 추가할 수 있으며, 단어 데이터 형식이 올바른지 검사합니다.
+        allow create: if isOwner(userId) && isValidWord();
+
+        // 수정(update): 본인의 단어만 수정할 수 있으며, 단어 데이터 형식이 올바르고 최초 생성일(createdAt)이 변조되지 않아야 합니다.
+        allow update: if isOwner(userId) &&
+                      isValidWord() &&
+                      request.resource.data.createdAt == resource.data.createdAt;
+
+        // 삭제(delete): 본인의 단어만 삭제할 수 있습니다.
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    // 3. 기본 차단 규칙 (Default Deny)
+    // 위에서 명시적으로 허용하지 않은 모든 경로의 읽기와 쓰기를 전면 차단합니다.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
